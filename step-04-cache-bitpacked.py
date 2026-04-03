@@ -276,6 +276,7 @@ def run_test(model, tokenizer, prompt, label, bits=None):
             **inputs,
             max_new_tokens=150,
             do_sample=False,
+            return_dict_in_generate=True,
         )
 
     torch.cuda.synchronize()
@@ -284,23 +285,45 @@ def run_test(model, tokenizer, prompt, label, bits=None):
     if handle is not None:
         handle.remove()
 
-    generated = out[0][n_input:]
+    generated = out.sequences[0][n_input:]
     text      = tokenizer.decode(generated, skip_special_tokens=True)
     tps       = len(generated) / elapsed
     peak_mb   = torch.cuda.max_memory_allocated() / 1e6
 
-    result = {
-        "label":   label,
-        "text":    text,
-        "tps":     tps,
-        "peak_mb": peak_mb,
-        "n_input": n_input,
-        "tokens":  len(generated),
-    }
-
+    # Measure actual cache bytes directly from the returned cache tensors
+    cache_mb = None
     if cache_holder and cache_holder["cache"]:
-        result["cache_stats"] = cache_holder["cache"].memory_stats()
-        
+        stats    = cache_holder["cache"].memory_stats()
+        cache_mb = stats["total_kb"] / 1024
+    elif out.past_key_values is not None:
+        pkv = out.past_key_values
+        cache_bytes = 0
+        # transformers v5+ DynamicCache stores per-layer state in .layers
+        layers = getattr(pkv, "layers", None)
+        if layers is not None:
+            for layer_cache in layers:
+                for t in vars(layer_cache).values():
+                    if isinstance(t, torch.Tensor):
+                        cache_bytes += t.numel() * t.element_size()
+        # Fallback: older API with key_cache / value_cache lists
+        if cache_bytes == 0:
+            for attr_name in ("key_cache", "value_cache"):
+                lst = getattr(pkv, attr_name, None)
+                if isinstance(lst, list):
+                    for t in lst:
+                        if isinstance(t, torch.Tensor):
+                            cache_bytes += t.numel() * t.element_size()
+        cache_mb = cache_bytes / (1024 * 1024)
+
+    result = {
+        "label":    label,
+        "text":     text,
+        "tps":      tps,
+        "peak_mb":  peak_mb,
+        "n_input":  n_input,
+        "tokens":   len(generated),
+        "cache_mb": cache_mb,
+    }
     return result
 
 def main():
@@ -320,21 +343,16 @@ def main():
             r = run_test(model, tokenizer, prompt, cfg_label, bits=bits)
             all_results[cfg_label].append(r)
             print(f"  [{p_label}] → {r['tps']:.1f} tok/s | peak {r['peak_mb']:.0f} MB")
-            if "cache_stats" in r:
-                s = r["cache_stats"]
-                print(f"      Cache Size: {s['total_kb']/1024:.2f} MB (vs fp16 baseline)")
+            if r["cache_mb"] is not None:
+                label_suffix = "(vs fp16 baseline)" if bits is not None else "(FP16, measured)"
+                print(f"      Cache Size: {r['cache_mb']:.2f} MB {label_suffix}")
                 
     sep("SUMMARY")
     for cfg_label, results in all_results.items():
         print(f"\n{cfg_label}:")
         for i, r in enumerate(results):
             p = ["short", "long "][i]
-            if "cache_stats" in r:
-                 print(f"  {p}: {r['cache_stats']['total_kb']/1024:.2f} MB Cache size")
-            else:
-                 # Baseline FP16 math: 8 layers * 4 KV heads * 2 (K+V) * seq_len * 256 head_dim * 2 bytes
-                 estimated_mb = (8 * 4 * 2 * (r['n_input'] + 150) * 256 * 2) / (1024*1024)
-                 print(f"  {p}: ~{estimated_mb:.2f} MB Cache size (FP16 Estimate)")
+            print(f"  {p}: {r['cache_mb']:.2f} MB Cache size")
 
 if __name__ == "__main__":
     main()
@@ -378,3 +396,13 @@ if __name__ == "__main__":
 # TurboQuant 4-bit PACKED:
 #   short: 2.83 MB Cache size
 #   long : 42.81 MB Cache size
+
+# --------------------------------------------------------------
+# After updating to measure actual cache size directly from tensors:
+# ───────────────────────── SUMMARY ────────────────────────
+# **Test Configuration:** Qwen/Qwen3.5-9B (4,691 input tokens, measured directly from the cache tensors)
+
+# | Configuration               | Tokens/sec | Cache VRAM (Measured) |
+# | :-------------------------- | :--------- | :-------------------- |
+# | **Baseline (FP16)**         | 9.5 tok/s  | 176.75 MB             |
+# | **TurboQuant 4-Bit PACKED** | 7.9 tok/s  | **42.81 MB**          |
