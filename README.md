@@ -1,6 +1,6 @@
 # 🚀 qwen3.5-tq-cache-fix
 
-A custom cache injection to make TurboQuant's 4-bit KV compression fully compatible with Qwen3.5's Hybrid-Attention architecture.
+A custom cache injection to make TurboQuant's 4-bit KV compression fully compatible with Qwen3.5's Hybrid-Attention architecture — now with **DeltaNet magnitude pruning** for an even deeper compression.
 
 _(Disclaimer: This was largely "vibe coded" into existence! 😅 I built it to solve a specific gap I hit in my own research. The math works and the VRAM savings are real, but constructive feedback and PRs on the code structure are totally welcome!)_
 
@@ -10,33 +10,58 @@ TurboQuant is incredible at squeezing KV caches down to ~3 or 4 bits using rando
 
 ## ✨ The Solution
 
-This repository provides a custom `HybridTurboQuantCache` class that acts as a surgical interceptor:
+This repository provides two cache classes that act as surgical interceptors:
+
+### `HybridTurboQuantCache` (attention-only compression)
 
 1. **Identifies** standard attention layers (indices 3, 7, 11, 15, 19, 23, 27, 31) and applies true 4-bit bit-packed TurboQuant compression to the KV cache.
 2. **Identifies** DeltaNet layers and passes their state matrices through 100% untouched.
-3. **Injects** itself cleanly using PyTorch forward pre-hooks, meaning you don't have to alter the underlying model weights at all.
+3. **Injects** itself cleanly using PyTorch forward pre-hooks — no model weight modifications.
+
+### `UltimateHybridCache` (attention + DeltaNet compression)
+
+Goes further by also compressing the DeltaNet recurrent states:
+
+1. **Attention layers** → 4-bit TurboQuant bit-packing (same as above)
+2. **DeltaNet layers** → 50% magnitude pruning via PyTorch sparse tensors (threshold calibrated in Step 5)
 
 ## 📊 Results & VRAM Savings
 
-By implementing true bit-packing (storing two 4-bit integers in a single `uint8` byte), this custom cache drastically reduces the memory footprint during long-context generation without sacrificing output quality.
+### Attention-Only Compression (Step 4)
 
-**Test Configuration:** Qwen/Qwen3.5-9B (4,691 input tokens, measured directly from the cache tensors)
+**Test Configuration:** Qwen/Qwen3.5-9B (4,691 input tokens, measured directly from cache tensors)
 
 | Configuration               | Tokens/sec | Cache VRAM (Measured) |
 | :-------------------------- | :--------- | :-------------------- |
 | **Baseline (FP16)**         | 9.5 tok/s  | 176.75 MB             |
 | **TurboQuant 4-Bit PACKED** | 7.9 tok/s  | **42.81 MB**          |
 
-**🔥 Result: A ~4.1x reduction in KV cache memory footprint!**
+**🔥 ~4.1x reduction in KV cache memory!**
+
+### Ultimate Hybrid Cache (Benchmark)
+
+**Test Configuration:** Qwen/Qwen3.5-9B (1,287 input tokens, measured directly from cache tensors)
+
+| Configuration                     | Tokens/sec | Cache VRAM (Measured) |
+| :-------------------------------- | :--------- | :-------------------- |
+| **Baseline (FP16)**               | 11.7 tok/s | 70.38 MB              |
+| **Ultimate (4-bit + 50% Sparse)** | 10.9 tok/s | **13.72 MB**          |
+
+**🔥 ~5.1x reduction — compressing BOTH attention KV and DeltaNet state!**
 
 ## 🗂️ Repository Structure
 
 ```
-cache_injector.py          ← Production module — import this in your own code
-step-01-inspector.py       ← Inspect Qwen3.5 layer types & config
-step-02-compressor.py      ← Standalone TurboQuant compress/decompress benchmark
-step-03-cache.py           ← First cache attempt (documents the hook-return bug)
-step-04-cache-bitpacked.py ← Fixed cache with true 4-bit bit-packing (final version)
+ultimate_qwen_hybrid_cache.py  ← Production module (TurboQuant + DeltaNet sparse pruning)
+qewn_turboquant_cache.py       ← Attention-only production module (TurboQuant only)
+benchmark.py                   ← Head-to-head VRAM benchmark (baseline vs ultimate)
+step-01-inspector.py           ← Inspect Qwen3.5 layer types & config
+step-02-compressor.py          ← Standalone TurboQuant compress/decompress benchmark
+step-03-cache.py               ← First cache attempt (documents the hook-return bug)
+step-04-cache-bitpacked.py     ← Fixed cache with true 4-bit bit-packing
+step-05-calibration.py         ← DeltaNet magnitude pruning calibration loop
+step-06-ultimate-hybrid-cache.py ← Development version of the ultimate cache
+step-07-test-ultimate.py       ← Quick smoke test for the ultimate cache
 ```
 
 Each step script is self-contained, runnable, and has the actual terminal output
@@ -60,7 +85,7 @@ pip install -r requirements.txt
 ```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from cache_injector import inject_turbo_cache
+from ultimate_qwen_hybrid_cache import inject_ultimate_cache
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -78,8 +103,8 @@ model = AutoModelForCausalLM.from_pretrained(
 
 inputs = tokenizer("Tell me about the universe.", return_tensors="pt").to(model.device)
 
-# Inject the custom cache BEFORE generation
-handle, cache_holder = inject_turbo_cache(model, bits=4, residual_len=64)
+# Inject the ultimate cache BEFORE generation
+handle, cache_holder = inject_ultimate_cache(model, bits=4, residual_len=64)
 
 with torch.no_grad():
     out = model.generate(**inputs, max_new_tokens=200, do_sample=False)
@@ -143,4 +168,46 @@ Baseline (no TQ):
 TurboQuant 4-bit PACKED:
   short:  2.83 MB Cache size
   long : 42.81 MB Cache size   ← ~4.1× smaller 🔥
+```
+
+### Step 5 — DeltaNet Sparsity Calibration ([step-05-calibration.py](step-05-calibration.py))
+
+Captures a live DeltaNet recurrent state from Qwen3.5 and stress-tests
+magnitude pruning at increasing sparsity levels. The goal: find the maximum
+safe sparsity before cosine similarity drops below 0.99.
+
+```
+  Target %   Cosine Sim   Verdict
+     10%        0.9999    ✅ Perfect
+     30%        0.9982    ✅ Perfect
+     50%        0.9903    ✅ Perfect     ← chosen threshold
+     60%        0.9815    🟡 Risky but viable
+     80%        0.9411    ⚠️ Degraded
+     95%        0.8481    ❌ Destroyed
+```
+
+### Step 6 — Ultimate Hybrid Cache ([step-06-ultimate-hybrid-cache.py](step-06-ultimate-hybrid-cache.py))
+
+Combines both compression strategies into one cache class:
+
+- **Attention layers**: 4-bit TurboQuant bit-packing
+- **DeltaNet layers**: 50% magnitude pruning → PyTorch sparse COO tensors
+
+### Step 7 — Quick Test ([step-07-test-ultimate.py](step-07-test-ultimate.py))
+
+Smoke test that loads Qwen3.5 with the `UltimateHybridCache` injected and
+generates a response end-to-end.
+
+### Benchmark ([benchmark.py](benchmark.py))
+
+The definitive head-to-head: baseline FP16 vs. Ultimate Hybrid Cache, with
+cache sizes measured by recursively walking every tensor in the cache objects.
+
+```
+  Baseline Cache Size:    70.38 MB
+  Ultimate Cache Size:    13.72 MB
+  Compression Ratio:       5.13x Smaller! 🔥
+
+  Baseline Speed:          11.7 tok/s
+  Ultimate Speed:          10.9 tok/s
 ```
