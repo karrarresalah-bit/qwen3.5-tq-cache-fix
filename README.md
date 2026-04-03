@@ -20,14 +20,14 @@ This repository provides a custom `HybridTurboQuantCache` class that acts as a s
 
 By implementing true bit-packing (storing two 4-bit integers in a single `uint8` byte), this custom cache drastically reduces the memory footprint during long-context generation without sacrificing output quality.
 
-**Test Configuration:** Qwen/Qwen3.5-9B (4,691 input tokens)
+**Test Configuration:** Qwen/Qwen3.5-9B (4,691 input tokens, measured directly from the cache tensors)
 
-| Configuration               | Tokens/sec | Cache VRAM (Estimated) | Cache VRAM (Actual Tracked) |
-| :-------------------------- | :--------- | :--------------------- | :-------------------------- |
-| **Baseline (FP16)**         | 9.5 tok/s  | ~151.28 MB             | N/A                         |
-| **TurboQuant 4-Bit PACKED** | 7.9 tok/s  | N/A                    | **42.81 MB**                |
+| Configuration               | Tokens/sec | Cache VRAM (Measured) |
+| :-------------------------- | :--------- | :-------------------- |
+| **Baseline (FP16)**         | 9.5 tok/s  | 176.75 MB             |
+| **TurboQuant 4-Bit PACKED** | 7.9 tok/s  | **42.81 MB**          |
 
-**🔥 Result: A ~3.5x reduction in KV cache memory footprint!**
+**🔥 Result: A ~4.1x reduction in KV cache memory footprint!**
 
 ## 🗂️ Repository Structure
 
@@ -132,14 +132,15 @@ of `(args, kwargs)`. This file documents that bug and its traceback.
 ### Step 4 — Fixed Bit-Packed Cache ([step-04-cache-bitpacked.py](step-04-cache-bitpacked.py))
 
 Fixes the hook return value, adds true 4-bit bit-packing (two 4-bit values per
-`uint8` byte), and confirms end-to-end results.
+`uint8` byte), and confirms end-to-end results. Cache sizes are measured
+directly from the returned cache tensors (no estimates).
 
 ```
 Baseline (no TQ):
-  short: ~5.06 MB Cache size (FP16 Estimate)
-  long : ~151.28 MB Cache size (FP16 Estimate)
+  short:  30.53 MB Cache size (FP16, measured)
+  long : 176.75 MB Cache size (FP16, measured)
 
 TurboQuant 4-bit PACKED:
-  short: 2.83 MB Cache size
-  long : 42.81 MB Cache size   ← ~3.5× smaller 🔥
+  short:  2.83 MB Cache size
+  long : 42.81 MB Cache size   ← ~4.1× smaller 🔥
 ```
